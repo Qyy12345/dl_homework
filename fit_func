@@ -6,154 +6,403 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.preprocessing import StandardScaler, PolynomialFeatures
 from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, Matern, RationalQuadratic, DotProduct
+from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, Matern, RationalQuadratic, DotProduct, WhiteKernel
 from sklearn.model_selection import KFold
+from sklearn.ensemble import RandomForestRegressor, ExtraTreesRegressor
+from sklearn.linear_model import Ridge
 import matplotlib.pyplot as plt
 import warnings
 import time
+from scipy.optimize import minimize
+from scipy.interpolate import interp1d
+import gc
 
 warnings.filterwarnings('ignore')
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Running on: {DEVICE}")
-print("Target Runtime: ~2-3 Hours on CPU")
+print("Target Runtime: Extended for Maximum Precision")
 
-# ================= 模块 1: GPR (高精度版) =================
+# ================= 模块 1: GPR (超高精度集成版) =================
 def solve_with_gp_precise(x_train, y_train, x_test, task_name="Task"):
-    print(f"\n>>> [{task_name}] 启动 GPR 高精度模式 (搜索 50 次)...")
-    
+    print(f"\n>>> [{task_name}] 启动 GPR 超高精度集成模式...")
+
+    # 数据预处理 - 多种缩放策略
     scaler_x = StandardScaler()
     scaler_y = StandardScaler()
-    
+
     x_train_scaled = scaler_x.fit_transform(x_train)
     y_train_scaled = scaler_y.fit_transform(y_train)
     x_test_scaled = scaler_x.transform(x_test)
-    
-    # 混合强力核函数
-    kernel = C(1.0, (1e-3, 1e4)) * Matern(length_scale=1.0, length_scale_bounds=(1e-2, 1e3), nu=2.5) \
-             + RationalQuadratic(length_scale=1.0, alpha=0.1) \
-             + C(0.1) * DotProduct(sigma_0=0.0)
 
-    # 50次重启：在精度和时间之间的完美平衡
-    gp = GaussianProcessRegressor(
-        kernel=kernel, 
-        alpha=1e-10, 
-        n_restarts_optimizer=50, 
-        normalize_y=False
+    # 存储多个模型的预测
+    all_predictions = []
+
+    # 模型1: 增强核函数组合
+    kernel1 = (C(1.0, (1e-4, 1e6)) * Matern(length_scale=1.0, length_scale_bounds=(1e-3, 1e4), nu=2.5)
+               + RationalQuadratic(length_scale=1.0, alpha=0.5, length_scale_bounds=(1e-2, 1e3), alpha_bounds=(1e-2, 10))
+               + C(0.1, (1e-4, 1e2)) * DotProduct(sigma_0=0.0)
+               + WhiteKernel(noise_level=1e-10, noise_level_bounds=(1e-12, 1e-5)))
+
+    gp1 = GaussianProcessRegressor(
+        kernel=kernel1,
+        alpha=1e-12,  # 更小的噪声
+        n_restarts_optimizer=100,  # 增加到100次重启
+        normalize_y=True,  # 开启标准化
+        random_state=42
     )
-    
-    gp.fit(x_train_scaled, y_train_scaled)
-    print(f"   训练集 R2: {gp.score(x_train_scaled, y_train_scaled):.8f}")
+    gp1.fit(x_train_scaled, y_train_scaled.ravel())
+    pred1 = gp1.predict(x_test_scaled)
+    all_predictions.append(pred1)
+    print(f"   Model 1 R2: {gp1.score(x_train_scaled, y_train_scaled.ravel()):.8f}")
 
-    y_pred_scaled = gp.predict(x_test_scaled)
+    # 模型2: 纯RBF核，不同参数范围
+    kernel2 = C(2.0, (1e-3, 1e5)) * RBF(length_scale=1.0, length_scale_bounds=(1e-2, 1e4))
+
+    gp2 = GaussianProcessRegressor(
+        kernel=kernel2,
+        alpha=5e-11,
+        n_restarts_optimizer=75,
+        normalize_y=True,
+        random_state=123
+    )
+    gp2.fit(x_train_scaled, y_train_scaled.ravel())
+    pred2 = gp2.predict(x_test_scaled)
+    all_predictions.append(pred2)
+    print(f"   Model 2 R2: {gp2.score(x_train_scaled, y_train_scaled.ravel()):.8f}")
+
+    # 模型3: Matern核，nu=1.5
+    kernel3 = C(1.5, (1e-3, 1e5)) * Matern(length_scale=0.5, length_scale_bounds=(1e-3, 1e3), nu=1.5)
+
+    gp3 = GaussianProcessRegressor(
+        kernel=kernel3,
+        alpha=8e-11,
+        n_restarts_optimizer=60,
+        normalize_y=True,
+        random_state=456
+    )
+    gp3.fit(x_train_scaled, y_train_scaled.ravel())
+    pred3 = gp3.predict(x_test_scaled)
+    all_predictions.append(pred3)
+    print(f"   Model 3 R2: {gp3.score(x_train_scaled, y_train_scaled.ravel()):.8f}")
+
+    # 集成预测 - 使用加权平均，权重基于R2分数
+    r2_scores = [
+        gp1.score(x_train_scaled, y_train_scaled.ravel()),
+        gp2.score(x_train_scaled, y_train_scaled.ravel()),
+        gp3.score(x_train_scaled, y_train_scaled.ravel())
+    ]
+    weights = np.array(r2_scores) / np.sum(r2_scores)
+
+    y_pred_scaled = sum(w * pred for w, pred in zip(weights, all_predictions))
     preds = scaler_y.inverse_transform(y_pred_scaled.reshape(-1, 1)).flatten()
+
+    print(f"   Ensemble R2: {np.mean(r2_scores):.8f}")
     return preds
 
 # ================= 模块 2: 10-Fold 深度学习 (充分利用时间) =================
 
 def augment_features(x):
-    poly = PolynomialFeatures(degree=2, include_bias=False)
-    x_poly = poly.fit_transform(x) 
+    # 更丰富的特征工程
+    poly = PolynomialFeatures(degree=3, include_bias=False)  # 提升到3次
+    x_poly = poly.fit_transform(x)
+
+    # 三角函数特征
     x_sin = np.sin(x)
     x_cos = np.cos(x)
-    return np.hstack([x_poly, x_sin, x_cos])
+    x_tan = np.tanh(x)  # 避免无穷值
+
+    # 指数和对数特征（小心负值）
+    x_exp = np.exp(-np.abs(x))  # 负指数避免爆炸
+    x_log = np.log1p(np.abs(x)) * np.sign(x)  # 带符号的对数
+
+    # 根号特征
+    x_sqrt = np.sqrt(np.abs(x)) * np.sign(x)
+
+    # 倒数特征（小心0值）
+    x_inv = 1.0 / (1.0 + np.abs(x)) * np.sign(x)
+
+    # 高次三角特征
+    x_sin2 = np.sin(2 * x)
+    x_cos2 = np.cos(2 * x)
+
+    return np.hstack([x_poly, x_sin, x_cos, x_tan, x_exp, x_log, x_sqrt, x_inv, x_sin2, x_cos2])
 
 class DeepNetPro(nn.Module):
     def __init__(self, input_dim):
         super(DeepNetPro, self).__init__()
-        # 512 宽度的网络在 CPU 上计算稍慢，但精度更高
+        # 更深更宽的网络架构
         self.net = nn.Sequential(
-            nn.Linear(input_dim, 512),
+            # 第一层：输入层到宽隐藏层
+            nn.Linear(input_dim, 1024),
             nn.GELU(),
+            nn.BatchNorm1d(1024),
+            nn.Dropout(0.05),
+
+            # 第二层：保持宽度
+            nn.Linear(1024, 1024),
+            nn.GELU(),
+            nn.BatchNorm1d(1024),
+            nn.Dropout(0.05),
+
+            # 第三层：保持宽度
+            nn.Linear(1024, 1024),
+            nn.GELU(),
+            nn.BatchNorm1d(1024),
+            nn.Dropout(0.05),
+
+            # 第四层：开始收缩
+            nn.Linear(1024, 512),
+            nn.GELU(),
+            nn.BatchNorm1d(512),
+            nn.Dropout(0.03),
+
+            # 第五层：进一步收缩
             nn.Linear(512, 512),
             nn.GELU(),
-            nn.Linear(512, 512),
-            nn.GELU(),
+            nn.BatchNorm1d(512),
+
+            # 第六层：继续收缩
             nn.Linear(512, 256),
             nn.GELU(),
+            nn.BatchNorm1d(256),
+
+            # 第七层：接近输出
             nn.Linear(256, 128),
+            nn.GELU(),
+            nn.BatchNorm1d(128),
+
+            # 输出层
+            nn.Linear(128, 1)
+        )
+
+        # 残差连接（可选）
+        self.shortcut = nn.Sequential(
+            nn.Linear(input_dim, 128),
             nn.GELU(),
             nn.Linear(128, 1)
         )
-    
+
     def forward(self, x):
-        return self.net(x)
+        main_out = self.net(x)
+        # 残差连接帮助训练
+        if x.shape[1] == 1:  # 如果是单输入，可以尝试残差连接
+            shortcut_out = self.shortcut(x) * 0.1  # 小权重残差
+            return main_out + shortcut_out
+        return main_out
 
 def solve_with_nn_10fold(x_train, y_train, x_test, task_name="Task"):
-    print(f"\n>>> [{task_name}] 启动 10-Fold 交叉验证 (这是耗时大户)...")
-    
-    # 1. 特征工程
+    print(f"\n>>> [{task_name}] 启动 超高精度 10-Fold 深度学习集成模式...")
+
+    # 1. 增强特征工程
     x_train_aug = augment_features(x_train)
     x_test_aug = augment_features(x_test)
     input_dim = x_train_aug.shape[1]
-    
+
     # 2. 归一化
     scaler_x = StandardScaler()
     scaler_y = StandardScaler()
     x_train_scaled = scaler_x.fit_transform(x_train_aug)
     y_train_scaled = scaler_y.fit_transform(y_train)
     x_test_scaled = scaler_x.transform(x_test_aug)
-    
+
     x_test_t = torch.tensor(x_test_scaled, dtype=torch.float32).to(DEVICE)
-    
-    # 3. K-Fold 训练 (10折)
-    # 10折意味着我们要训练 10 个模型。
-    kfold = KFold(n_splits=10, shuffle=True, random_state=42)
+
+    # 3. K-Fold 训练 (15折以获得更好的泛化)
+    kfold = KFold(n_splits=15, shuffle=True, random_state=42)  # 增加到15折
     fold_preds = []
-    
-    # 设定为 2500 轮，充分收敛
-    EPOCHS = 2500 
-    
+    fold_val_losses = []
+
+    # 增加训练轮数，允许充分收敛
+    EPOCHS = 4000  # 增加到4000轮
+
     start_time = time.time()
-    
+
     for fold, (train_idx, val_idx) in enumerate(kfold.split(x_train_scaled)):
         fold_start = time.time()
-        print(f"   [Fold {fold+1}/10] Training...")
-        
+        print(f"   [Fold {fold+1}/15] Training...")
+
         X_fold_train = torch.tensor(x_train_scaled[train_idx], dtype=torch.float32).to(DEVICE)
         y_fold_train = torch.tensor(y_train_scaled[train_idx], dtype=torch.float32).to(DEVICE)
         X_fold_val = torch.tensor(x_train_scaled[val_idx], dtype=torch.float32).to(DEVICE)
         y_fold_val = torch.tensor(y_train_scaled[val_idx], dtype=torch.float32).to(DEVICE)
-        
+
         train_dataset = TensorDataset(X_fold_train, y_fold_train)
-        train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True)
-        
+        # 动态批大小
+        batch_size = min(512, len(X_fold_train) // 4)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
         model = DeepNetPro(input_dim=input_dim).to(DEVICE)
-        optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-6)
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-8)
+
+        # 更优的优化器和调度器
+        optimizer = optim.AdamW(model.parameters(), lr=0.0008, weight_decay=1e-5, betas=(0.9, 0.999))
+        scheduler = optim.lr_scheduler.OneCycleLR(
+            optimizer, max_lr=0.002, epochs=EPOCHS,
+            steps_per_epoch=len(train_loader), pct_start=0.3
+        )
         criterion = nn.MSELoss()
-        
+
+        # 早停机制（但允许充分训练）
+        best_val_loss = float('inf')
+        patience_counter = 0
+        patience = 800  # 很大的耐心值
+
         model.train()
         for epoch in range(EPOCHS):
+            epoch_train_loss = 0
             for bx, by in train_loader:
                 optimizer.zero_grad()
                 out = model(bx)
                 loss = criterion(out, by)
                 loss.backward()
+
+                # 梯度裁剪防止爆炸
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
                 optimizer.step()
-            scheduler.step()
-            
-        # 验证
+                scheduler.step()
+                epoch_train_loss += loss.item()
+
+            # 每100轮验证一次
+            if epoch % 100 == 0 or epoch == EPOCHS - 1:
+                model.eval()
+                with torch.no_grad():
+                    val_out = model(X_fold_val)
+                    val_loss = criterion(val_out, y_fold_val).item()
+
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        patience_counter = 0
+                        # 保存最佳模型状态
+                        best_model_state = model.state_dict().copy()
+                    else:
+                        patience_counter += 1
+
+                model.train()
+
+            # 学习率衰减到极小值时停止早停检查
+            if scheduler.get_last_lr()[0] < 1e-7:
+                patience = 200  # 最后阶段减少耐心
+
+            if patience_counter >= patience:
+                print(f"        Early stopping at epoch {epoch}")
+                break
+
+        # 加载最佳模型进行预测
+        model.load_state_dict(best_model_state)
         model.eval()
         with torch.no_grad():
             val_out = model(X_fold_val)
             val_loss = criterion(val_out, y_fold_val).item()
             fold_pred = model(x_test_t).cpu().numpy()
             fold_preds.append(fold_pred)
-            
+            fold_val_losses.append(val_loss)
+
         fold_time = time.time() - fold_start
-        # 估算剩余时间
         elapsed = time.time() - start_time
         avg_time_per_fold = elapsed / (fold + 1)
-        remaining = avg_time_per_fold * (10 - fold - 1)
-        print(f"      -> Fold {fold+1} Loss: {val_loss:.8f} | Time: {fold_time:.0f}s | Est. Remaining: {remaining/60:.1f} min")
+        remaining = avg_time_per_fold * (15 - fold - 1)
+
+        print(f"      -> Fold {fold+1} Best Loss: {val_loss:.10f} | Time: {fold_time:.0f}s | Est. Remaining: {remaining/60:.1f} min")
 
     total_time = (time.time() - start_time) / 60
-    print(f"   10-Fold Training Completed in {total_time:.1f} minutes.")
+    avg_val_loss = np.mean(fold_val_losses)
+    print(f"   15-Fold Training Completed in {total_time:.1f} minutes.")
+    print(f"   Average Validation Loss: {avg_val_loss:.10f}")
 
-    # 4. 平均
-    avg_preds_scaled = np.mean(fold_preds, axis=0)
-    preds = scaler_y.inverse_transform(avg_preds_scaled).flatten()
+    # 4. 加权平均 - 基于验证损失的权重
+    val_losses_arr = np.array(fold_val_losses)
+    # 将损失转换为权重（损失越小权重越大）
+    max_loss = np.max(val_losses_arr)
+    weights = (max_loss - val_losses_arr + 1e-8) / np.sum(max_loss - val_losses_arr + 1e-8)
+
+    # 加权平均预测
+    weighted_preds_scaled = sum(w * pred for w, pred in zip(weights, fold_preds))
+    preds = scaler_y.inverse_transform(weighted_preds_scaled).flatten()
+
     return preds
+
+# ================= 模块 3: 混合集成策略 =================
+def ensemble_predictions(methods_preds, x_test, y_train=None, weights_type="uniform"):
+    """
+    集成多个方法的预测结果
+    methods_preds: 包含不同方法预测结果的列表
+    """
+    if weights_type == "uniform":
+        # 均等权重
+        final_pred = np.mean(methods_preds, axis=0)
+    elif weights_type == "confidence" and y_train is not None:
+        # 如果有训练数据，可以计算置信度权重
+        # 这里简化处理，实际应该基于交叉验证性能
+        final_pred = np.mean(methods_preds, axis=0)
+    else:
+        final_pred = np.mean(methods_preds, axis=0)
+
+    return final_pred
+
+def solve_with_ensemble(x_train, y_train, x_test, task_name="Task", use_ml_models=False):
+    """
+    使用多种方法的集成
+    """
+    print(f"\n>>> [{task_name}] 启动 超级集成模式...")
+
+    # 1. GPR高精度预测
+    pred_gp = solve_with_gp_precise(x_train, y_train, x_test, task_name)
+
+    # 2. 深度学习预测（适用于复杂函数）
+    if x_train.shape[1] > 1 or len(y_train) > 1000:
+        pred_nn = solve_with_nn_10fold(x_train, y_train, x_test, task_name)
+        all_preds = [pred_gp, pred_nn]
+    else:
+        all_preds = [pred_gp]
+
+    # 3. 可选：添加传统ML模型（用于基准和集成）
+    if use_ml_models:
+        try:
+            # 数据预处理
+            scaler_x = StandardScaler()
+            scaler_y = StandardScaler()
+            x_train_scaled = scaler_x.fit_transform(x_train)
+            y_train_scaled = scaler_y.fit_transform(y_train).ravel()
+            x_test_scaled = scaler_x.transform(x_test)
+
+            # 随机森林
+            rf = RandomForestRegressor(
+                n_estimators=1000,
+                max_depth=30,
+                min_samples_split=2,
+                min_samples_leaf=1,
+                max_features='sqrt',
+                random_state=42
+            )
+            rf.fit(x_train_scaled, y_train_scaled)
+            pred_rf_scaled = rf.predict(x_test_scaled)
+            pred_rf = scaler_y.inverse_transform(pred_rf_scaled.reshape(-1, 1)).flatten()
+            all_preds.append(pred_rf)
+            print(f"   Random Forest R2: {rf.score(x_train_scaled, y_train_scaled):.6f}")
+
+            # 极端随机树
+            et = ExtraTreesRegressor(
+                n_estimators=800,
+                max_depth=25,
+                min_samples_split=2,
+                min_samples_leaf=1,
+                max_features='sqrt',
+                random_state=123
+            )
+            et.fit(x_train_scaled, y_train_scaled)
+            pred_et_scaled = et.predict(x_test_scaled)
+            pred_et = scaler_y.inverse_transform(pred_et_scaled.reshape(-1, 1)).flatten()
+            all_preds.append(pred_et)
+            print(f"   Extra Trees R2: {et.score(x_train_scaled, y_train_scaled):.6f}")
+
+        except Exception as e:
+            print(f"   ML models failed: {e}")
+
+    # 4. 最终集成
+    final_pred = ensemble_predictions(all_preds, x_test, y_train, weights_type="uniform")
+    print(f"   Ensemble completed with {len(all_preds)} methods")
+
+    return final_pred
 
 # ================= 主程序 =================
 print("Loading Data...")
@@ -164,22 +413,27 @@ d2_test = np.load('/kaggle/input/fit-functions/test2.npz')
 d3_train = np.load('/kaggle/input/fit-functions/train3.npz')
 d3_test = np.load('/kaggle/input/fit-functions/test3.npz')
 
-# F1 & F2 -> GPR Precise
+# F1 & F2 -> 使用增强集成策略（包含GPR+可选ML模型）
 x1_train = d1_train['x_train'].reshape(-1, 1)
 y1_train = d1_train['y_train'].reshape(-1, 1)
 x1_test = d1_test['x_test'].reshape(-1, 1)
-pred1 = solve_with_gp_precise(x1_train, y1_train, x1_test, "Function 1")
+pred1 = solve_with_ensemble(x1_train, y1_train, x1_test, "Function 1", use_ml_models=True)
 
 x2_train = d2_train['x_train'].reshape(-1, 1)
 y2_train = d2_train['y_train'].reshape(-1, 1)
 x2_test = d2_test['x_test'].reshape(-1, 1)
-pred2 = solve_with_gp_precise(x2_train, y2_train, x2_test, "Function 2")
+pred2 = solve_with_ensemble(x2_train, y2_train, x2_test, "Function 2", use_ml_models=True)
 
-# F3 -> 10-Fold NN
+# F3 -> 超高精度深度学习（最适合多变量复杂函数）
 x3_train = np.column_stack((d3_train['x_train1'], d3_train['x_train2']))
 y3_train = d3_train['y_train'].reshape(-1, 1)
 x3_test = np.column_stack((d3_test['x_test1'], d3_test['x_test2']))
 pred3 = solve_with_nn_10fold(x3_train, y3_train, x3_test, "Function 3")
+
+# 清理内存
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
 
 print("\nGenerating Submission...")
 ids = np.concatenate([d1_test['ID'], d2_test['ID'], d3_test['ID']])
