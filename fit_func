@@ -1,0 +1,191 @@
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.preprocessing import StandardScaler, PolynomialFeatures
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, Matern, RationalQuadratic, DotProduct
+from sklearn.model_selection import KFold
+import matplotlib.pyplot as plt
+import warnings
+import time
+
+warnings.filterwarnings('ignore')
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Running on: {DEVICE}")
+print("Target Runtime: ~2-3 Hours on CPU")
+
+# ================= 模块 1: GPR (高精度版) =================
+def solve_with_gp_precise(x_train, y_train, x_test, task_name="Task"):
+    print(f"\n>>> [{task_name}] 启动 GPR 高精度模式 (搜索 50 次)...")
+    
+    scaler_x = StandardScaler()
+    scaler_y = StandardScaler()
+    
+    x_train_scaled = scaler_x.fit_transform(x_train)
+    y_train_scaled = scaler_y.fit_transform(y_train)
+    x_test_scaled = scaler_x.transform(x_test)
+    
+    # 混合强力核函数
+    kernel = C(1.0, (1e-3, 1e4)) * Matern(length_scale=1.0, length_scale_bounds=(1e-2, 1e3), nu=2.5) \
+             + RationalQuadratic(length_scale=1.0, alpha=0.1) \
+             + C(0.1) * DotProduct(sigma_0=0.0)
+
+    # 50次重启：在精度和时间之间的完美平衡
+    gp = GaussianProcessRegressor(
+        kernel=kernel, 
+        alpha=1e-10, 
+        n_restarts_optimizer=50, 
+        normalize_y=False
+    )
+    
+    gp.fit(x_train_scaled, y_train_scaled)
+    print(f"   训练集 R2: {gp.score(x_train_scaled, y_train_scaled):.8f}")
+
+    y_pred_scaled = gp.predict(x_test_scaled)
+    preds = scaler_y.inverse_transform(y_pred_scaled.reshape(-1, 1)).flatten()
+    return preds
+
+# ================= 模块 2: 10-Fold 深度学习 (充分利用时间) =================
+
+def augment_features(x):
+    poly = PolynomialFeatures(degree=2, include_bias=False)
+    x_poly = poly.fit_transform(x) 
+    x_sin = np.sin(x)
+    x_cos = np.cos(x)
+    return np.hstack([x_poly, x_sin, x_cos])
+
+class DeepNetPro(nn.Module):
+    def __init__(self, input_dim):
+        super(DeepNetPro, self).__init__()
+        # 512 宽度的网络在 CPU 上计算稍慢，但精度更高
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 512),
+            nn.GELU(),
+            nn.Linear(512, 512),
+            nn.GELU(),
+            nn.Linear(512, 512),
+            nn.GELU(),
+            nn.Linear(512, 256),
+            nn.GELU(),
+            nn.Linear(256, 128),
+            nn.GELU(),
+            nn.Linear(128, 1)
+        )
+    
+    def forward(self, x):
+        return self.net(x)
+
+def solve_with_nn_10fold(x_train, y_train, x_test, task_name="Task"):
+    print(f"\n>>> [{task_name}] 启动 10-Fold 交叉验证 (这是耗时大户)...")
+    
+    # 1. 特征工程
+    x_train_aug = augment_features(x_train)
+    x_test_aug = augment_features(x_test)
+    input_dim = x_train_aug.shape[1]
+    
+    # 2. 归一化
+    scaler_x = StandardScaler()
+    scaler_y = StandardScaler()
+    x_train_scaled = scaler_x.fit_transform(x_train_aug)
+    y_train_scaled = scaler_y.fit_transform(y_train)
+    x_test_scaled = scaler_x.transform(x_test_aug)
+    
+    x_test_t = torch.tensor(x_test_scaled, dtype=torch.float32).to(DEVICE)
+    
+    # 3. K-Fold 训练 (10折)
+    # 10折意味着我们要训练 10 个模型。
+    kfold = KFold(n_splits=10, shuffle=True, random_state=42)
+    fold_preds = []
+    
+    # 设定为 2500 轮，充分收敛
+    EPOCHS = 2500 
+    
+    start_time = time.time()
+    
+    for fold, (train_idx, val_idx) in enumerate(kfold.split(x_train_scaled)):
+        fold_start = time.time()
+        print(f"   [Fold {fold+1}/10] Training...")
+        
+        X_fold_train = torch.tensor(x_train_scaled[train_idx], dtype=torch.float32).to(DEVICE)
+        y_fold_train = torch.tensor(y_train_scaled[train_idx], dtype=torch.float32).to(DEVICE)
+        X_fold_val = torch.tensor(x_train_scaled[val_idx], dtype=torch.float32).to(DEVICE)
+        y_fold_val = torch.tensor(y_train_scaled[val_idx], dtype=torch.float32).to(DEVICE)
+        
+        train_dataset = TensorDataset(X_fold_train, y_fold_train)
+        train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True)
+        
+        model = DeepNetPro(input_dim=input_dim).to(DEVICE)
+        optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-6)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-8)
+        criterion = nn.MSELoss()
+        
+        model.train()
+        for epoch in range(EPOCHS):
+            for bx, by in train_loader:
+                optimizer.zero_grad()
+                out = model(bx)
+                loss = criterion(out, by)
+                loss.backward()
+                optimizer.step()
+            scheduler.step()
+            
+        # 验证
+        model.eval()
+        with torch.no_grad():
+            val_out = model(X_fold_val)
+            val_loss = criterion(val_out, y_fold_val).item()
+            fold_pred = model(x_test_t).cpu().numpy()
+            fold_preds.append(fold_pred)
+            
+        fold_time = time.time() - fold_start
+        # 估算剩余时间
+        elapsed = time.time() - start_time
+        avg_time_per_fold = elapsed / (fold + 1)
+        remaining = avg_time_per_fold * (10 - fold - 1)
+        print(f"      -> Fold {fold+1} Loss: {val_loss:.8f} | Time: {fold_time:.0f}s | Est. Remaining: {remaining/60:.1f} min")
+
+    total_time = (time.time() - start_time) / 60
+    print(f"   10-Fold Training Completed in {total_time:.1f} minutes.")
+
+    # 4. 平均
+    avg_preds_scaled = np.mean(fold_preds, axis=0)
+    preds = scaler_y.inverse_transform(avg_preds_scaled).flatten()
+    return preds
+
+# ================= 主程序 =================
+print("Loading Data...")
+d1_train = np.load('/kaggle/input/fit-functions/train1.npz')
+d1_test = np.load('/kaggle/input/fit-functions/test1.npz')
+d2_train = np.load('/kaggle/input/fit-functions/train2.npz')
+d2_test = np.load('/kaggle/input/fit-functions/test2.npz')
+d3_train = np.load('/kaggle/input/fit-functions/train3.npz')
+d3_test = np.load('/kaggle/input/fit-functions/test3.npz')
+
+# F1 & F2 -> GPR Precise
+x1_train = d1_train['x_train'].reshape(-1, 1)
+y1_train = d1_train['y_train'].reshape(-1, 1)
+x1_test = d1_test['x_test'].reshape(-1, 1)
+pred1 = solve_with_gp_precise(x1_train, y1_train, x1_test, "Function 1")
+
+x2_train = d2_train['x_train'].reshape(-1, 1)
+y2_train = d2_train['y_train'].reshape(-1, 1)
+x2_test = d2_test['x_test'].reshape(-1, 1)
+pred2 = solve_with_gp_precise(x2_train, y2_train, x2_test, "Function 2")
+
+# F3 -> 10-Fold NN
+x3_train = np.column_stack((d3_train['x_train1'], d3_train['x_train2']))
+y3_train = d3_train['y_train'].reshape(-1, 1)
+x3_test = np.column_stack((d3_test['x_test1'], d3_test['x_test2']))
+pred3 = solve_with_nn_10fold(x3_train, y3_train, x3_test, "Function 3")
+
+print("\nGenerating Submission...")
+ids = np.concatenate([d1_test['ID'], d2_test['ID'], d3_test['ID']])
+vals = np.concatenate([pred1, pred2, pred3])
+df = pd.DataFrame({'ID': ids, 'VALUE': vals})
+df['ID'] = df['ID'].astype(int)
+df = df.sort_values('ID')
+df.to_csv('submission.csv', index=False)
+print("Done! Submission file ready.")
